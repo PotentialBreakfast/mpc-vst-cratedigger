@@ -1,3 +1,42 @@
 /* Skin stylesheet (the layout's art_css=), loaded after tools/html_art/default.css. Override its variables or
  * classes: .knob-face, .knob-arc, .frame-border, .frame-title, .seg-bg, .button-bg, .box, .slider-thumb, ...
- * Colours come from the layout's theme_* lines as var(--accent), var(--ink), ... */
+ * Colours come from the layout's theme_* lines as var(--accent), var(--ink), ...
+ *
+ * The box itself (cheeks, faceplate, a recessed well under each frame, screws, lighting) is images/chassis_*.svg,
+ * made by make_chassis.py. This file is the controls' half: one light from the top left, so every raised thing has
+ * a lit top edge and a shadow falling down and right, every sunk thing the reverse. */
+
+:root {
+  --sheen: 0.12;
+  --radius: 5px;
+  --shadow: drop-shadow(1px 2.5px 2.5px rgba(20, 14, 4, 0.55));
+  --engrave: drop-shadow(0 1px 0 rgba(255, 255, 255, 0.55));    /* lettering cut into the plate: light lip below */
+  --tick: #2b2822;
+}
+
+/* frames: the chassis draws the well, so the renderer's own box goes away and the lettering is engraved into it */
+.td3 .frame-border { fill: none; stroke: none; }
+.frame-title, .td3 .frame-title { fill: #3a352a; filter: var(--engrave); }
+.frame-rule { stroke: #5a5340; stroke-opacity: 0.55; filter: var(--engrave); }
+.box-label, .text { filter: var(--engrave); }
+
+/* keycaps (transport, SEARCH): a stepped edge, a glossy top and a hard contact shadow, so they stand off the plate */
+.button-bg {
+  stroke: rgba(15, 10, 4, 0.55); stroke-width: 1.5;
+  filter: drop-shadow(0 3px 0 rgba(30, 22, 8, 0.55)) drop-shadow(1px 6px 4px rgba(20, 14, 4, 0.45));
+}
+.button-sheen { fill: url(#key-gloss); opacity: 0.9; }
+.button-tx { filter: drop-shadow(0 -1px 0 rgba(0, 0, 0, 0.35)); }
+
+/* LCD readouts and steppers: glass sunk into the plate, a faint reflection across the top */
+.box { fill: #d6d2c0; stroke: #4a4330; stroke-width: 1.5; filter: drop-shadow(0 1.5px 0 rgba(255, 255, 255, 0.6)); }
+.arrow-bg { fill: var(--line); stroke: rgba(15, 10, 4, 0.5); stroke-width: 1.2;
+            filter: drop-shadow(0 2.5px 0 rgba(30, 22, 8, 0.5)) drop-shadow(1px 5px 3px rgba(20, 14, 4, 0.4)); }
+.arrow { fill: #1e1b14; }
+
+/* dot-matrix displays: a thick plastic bezel, set into the plate */
+.dot-bezel { filter: drop-shadow(0 1.5px 0 rgba(255, 255, 255, 0.55)) drop-shadow(0 -1px 0 rgba(0, 0, 0, 0.4)); }
+.dot-cell { stroke: rgba(0, 0, 0, 0.35); stroke-width: 1; }
+
+/* result rows: pressed-in seams */
+.tile-rule { fill: #5a5340; opacity: 0.55; filter: var(--engrave); }
