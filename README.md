@@ -22,11 +22,7 @@ screen.
 
 | PLAY | FILTERS |
 |---|---|
-| ![PLAY tab](docs/previews/shadow_play.png) | ![FILTERS tab](docs/previews/shadow_filters.png) |
-
-(Previews are of the original Force Shadow page this plugin's skin was
-ported from — see [Project history](#project-history) — not the MPC
-plugin skin itself.)
+| ![PLAY tab](docs/img/play.png) | ![FILTERS tab](docs/img/filters.png) |
 
 ## What it is
 
