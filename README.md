@@ -53,8 +53,11 @@ plugin skin itself.)
   sync off and a waiting track plays immediately.
 - **Results**: up to 16 results per search in a paged 8-row (2×4) list on
   the PLAY tab (two pages) — tapping a row plays it. A result whose
-  YouTube video has been removed or blocked shows **UNAVAILABLE** in
-  STATUS instead of ending in a bare EOF; just tap another row.
+  YouTube video has been removed or blocked says why in STATUS (PRIVATE
+  VIDEO, VIDEO REMOVED, COPYRIGHT, REGION BLOCKED, ...) and NOW PLAYING shows
+  yt-dlp's wording; just tap another row. A failed search says why too
+  (rate limit, bad token, no network, no playable videos, ...); see
+  [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 - **Discogs rate limit**: if Discogs answers "too many requests", the
   search stops at once and says how long to wait (or returns what it had
   already found) instead of hanging until it times out. A free Discogs
