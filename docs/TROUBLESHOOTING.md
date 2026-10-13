@@ -16,8 +16,25 @@ place — no need to remove it first. Add `-y` to skip the confirmation prompt.
 
 ## Search shows an "error" status
 
-The plugin screen only ever shows a short status word (`error`, `no_results`, ...) with no
-detail. As of v1.06, the actual reason is written to a log file on the device.
+The SEARCH line on the plugin screen says what went wrong, for example `DISCOGS REJECTED THE TOKEN (HTTP
+401)` or `NO PLAYABLE VIDEO IN 12 RELEASES TRIED, SEARCH AGAIN`. The line holds about 45 characters, so
+the full text is also written to a log file on the device (see below).
+
+| SEARCH line says | Meaning | Fix |
+|---|---|---|
+| `DISCOGS RATE LIMIT HIT, RETRY IN ~Ns` | Discogs said too many requests | Add a token (below), or wait N seconds |
+| `DISCOGS REJECTED THE TOKEN (HTTP 401/403)` | The token is wrong or revoked | Re-check `webstream_providers.json` |
+| `NO NETWORK: DNS LOOKUP FAILED` / `NO NETWORK: ...` | The device can't reach the internet | Check the device's network connection |
+| `NO ANSWER FROM DISCOGS (TIMED OUT)` | Discogs or the connection is too slow | Try again |
+| `DISCOGS SERVER ERROR (HTTP 5xx), TRY AGAIN` | Discogs is having a bad moment | Try again later |
+| `NO DISCOGS RELEASES MATCH THESE FILTERS` | The filter combination has no releases | Set a filter back to ANY |
+| `NO PLAYABLE VIDEO IN N RELEASES TRIED, ...` | Releases were found, none had a YouTube video | Search again, or loosen the filters |
+| `SEARCH HELPER ...` | The background helper didn't start or stopped answering | Restart MPC; report it if it repeats |
+
+The STATUS line names why a track would not play: `PRIVATE VIDEO`, `VIDEO REMOVED`, `COPYRIGHT`,
+`REGION BLOCKED`, `AGE / LOGIN`, `UNAVAILABLE`, `RATE LIMITED`, `TIMED OUT`, `NO NETWORK`,
+`YT-DLP MISSING` or `RESOLVE FAILED`; NOW PLAYING then shows the track and yt-dlp's own wording. A
+track that simply played to the end shows `TRACK ENDED`.
 
 ### 1. Set a Discogs token (fixes most search errors)
 
@@ -39,15 +56,9 @@ ssh root@<device-ip>
 cat /tmp/webstream-runtime.log
 ```
 
-Look for lines starting with `search error:` — the most recent one is the actual cause.
-Common ones:
-
-| Log line contains | Meaning | Fix |
-|---|---|---|
-| `HTTP Error 429` | Rate-limited by Discogs | Add a token (above), or wait a minute between searches |
-| `HTTP Error 401` | Token is missing/invalid | Re-check the token in `webstream_providers.json` |
-| `network error: ...` | Device has no internet/DNS | Check the device's network connection |
-| anything else | Not yet a known cause | Report it (see below) with the exact line |
+Look for lines starting with `search error:` — the most recent one is the actual cause, in the
+same words the SEARCH line used (untruncated). Anything that isn't in the table above is a cause
+we haven't seen: report it (see below) with the exact line.
 
 If the log file doesn't exist yet, no search has failed since the last MPC restart — try
 reproducing the issue, then check again.

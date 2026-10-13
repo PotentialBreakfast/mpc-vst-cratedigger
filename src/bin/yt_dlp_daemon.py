@@ -743,6 +743,38 @@ class RateLimited(Exception):
         self.retry_after = retry_after
 
 
+def describe_error(exc: Exception) -> str:
+    """The cause of a failed Discogs/network call, short and specific enough for the plugin's one-line status.
+
+    The plugin shows this text as is (upper-cased, cut at ~44 characters), so lead with what matters."""
+    import socket
+    if isinstance(exc, RateLimited):
+        return str(exc)
+    if isinstance(exc, urllib.error.HTTPError):
+        code = exc.code
+        if code in (401, 403):
+            return f"Discogs rejected the token (HTTP {code})"
+        if code == 404:
+            return "Discogs endpoint not found (HTTP 404)"
+        if code >= 500:
+            return f"Discogs server error (HTTP {code}), try again"
+        return f"Discogs refused the request (HTTP {code})"
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, socket.gaierror):
+            return "No network: DNS lookup failed"
+        if isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in str(reason):
+            return "No answer from Discogs (timed out)"
+        if isinstance(reason, ConnectionRefusedError):
+            return "No network: connection refused"
+        return f"No network: {reason}"
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "No answer from Discogs (timed out)"
+    if isinstance(exc, json.JSONDecodeError):
+        return "Discogs sent an unreadable reply"
+    return f"{type(exc).__name__}: {exc}"
+
+
 class CrateDigSession:
     DISCOGS_BASE = "https://api.discogs.com"
     MAX_EXCLUDE_IDS = 200
@@ -756,6 +788,7 @@ class CrateDigSession:
         self.filter_country = ""
         self.exclude_ids: list = []
         self.pool_size_cache: dict = {}
+        self.empty_reason = ""     # why the last get_random_releases() found nothing (set when it returns [])
 
     def _request(self, path: str, params: dict = None) -> dict:
         import time
@@ -852,11 +885,16 @@ class CrateDigSession:
 
     def get_random_releases(self, count: int = 5) -> list:
         import random
+        self.empty_reason = ""
         params = self._build_search_params()
         pool_size, first_results, first_page = self._get_pool_size_and_first_page(params)
         if pool_size == 0:
+            self.pool_size_cache.pop(self._cache_key(), None)   # don't remember an empty answer (it may have been a blip)
+            self.empty_reason = "No Discogs releases match these filters"
             return []
 
+        errors = []        # every Discogs call that failed and was skipped, so a run of failures isn't reported as "no results"
+        no_video = 0
         found = []
         seen_pages = set()
         release_lookups = 0
@@ -875,6 +913,8 @@ class CrateDigSession:
 
         while len(found) < count and len(seen_pages) < max_page_fetches and release_lookups < max_release_lookups:
             if not pages_data:
+                if len(seen_pages) >= pool_size:
+                    break      # every page of a small pool is already tried (looping on seen pages never ended)
                 page = random.randint(1, pool_size)
                 if page in seen_pages:
                     continue
@@ -887,7 +927,8 @@ class CrateDigSession:
                     if found:
                         break
                     raise
-                except Exception:
+                except Exception as exc:
+                    errors.append(exc)
                     continue
 
                 results = data.get("results", [])
@@ -912,11 +953,13 @@ class CrateDigSession:
                     if found:
                         return found
                     raise
-                except Exception:
+                except Exception as exc:
+                    errors.append(exc)
                     continue
 
                 videos = release.get("videos", [])
                 if not videos:
+                    no_video += 1
                     continue
 
                 video = videos[random.randint(0, len(videos) - 1)]
@@ -924,6 +967,7 @@ class CrateDigSession:
                 if not video_url or "youtube.com" not in video_url:
                     youtube_videos = [v for v in videos if "youtube.com" in (v.get("uri") or "")]
                     if not youtube_videos:
+                        no_video += 1
                         continue
                     video = youtube_videos[random.randint(0, len(youtube_videos) - 1)]
                     video_url = video.get("uri", "")
@@ -957,6 +1001,13 @@ class CrateDigSession:
                 })
 
         random.shuffle(found)
+        if not found:
+            if errors and no_video == 0:
+                raise errors[-1]      # nothing but failed calls: report the failure, not "no results"
+            if no_video:
+                self.empty_reason = f"No playable video in {no_video} releases tried, search again"
+            else:
+                self.empty_reason = "No releases found, search again"
         return found
 
 
@@ -1049,12 +1100,8 @@ def cratedig_search(session: CrateDigSession, count_text: str) -> None:
 
     try:
         releases = session.get_random_releases(count)
-    except urllib.error.URLError as exc:
-        reason = str(getattr(exc, "reason", exc))
-        write_fields("ERROR", f"network error: {reason}")
-        return
     except Exception as exc:
-        write_fields("ERROR", f"search failed: {exc}")
+        write_fields("ERROR", describe_error(exc))
         return
 
     n = 0
@@ -1077,7 +1124,10 @@ def cratedig_search(session: CrateDigSession, count_text: str) -> None:
                      "", "", "", genre, style, country, year)
         n += 1
 
-    write_fields("SEARCH_END", str(n))
+    if n:
+        write_fields("SEARCH_END", str(n))
+    else:
+        write_fields("SEARCH_END", "0", session.empty_reason or "Discogs results had no usable video links")
 
 
 def parse_search_parts(parts: list):

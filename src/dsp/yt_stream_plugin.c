@@ -163,6 +163,7 @@ typedef struct {
     size_t played_samples;
     size_t seek_discard_samples;
     double resume_offset_sec;  /* seek position for stream reconnect */
+    uint64_t base_abs;         /* where ring sample 0 sits in the track (samples): non-zero after a restart at an offset */
     int play_pause_step;
     int rewind_15_step;
     int forward_15_step;
@@ -455,16 +456,19 @@ static int start_daemon_locked(yt_instance_t *inst, char *err, size_t err_len) {
     }
 
     setvbuf(inst->daemon_in, NULL, _IOLBF, 0);
-    setvbuf(inst->daemon_out, NULL, _IOLBF, 0);
+    /* Unbuffered: read_daemon_line_locked() poll()s the fd then fgets()s. With a buffered stream, a reply that arrives in one
+     * burst (a short search: BEGIN, a few ITEMs, END) is slurped by the first fgets, so poll() sees an empty pipe and the
+     * rest of the reply "times out" although it is already here. */
+    setvbuf(inst->daemon_out, NULL, _IONBF, 0);
 
     if (read_daemon_line_locked(inst, line, sizeof(line), DAEMON_START_TIMEOUT_MS) != 0) {
-        if (err && err_len > 0) snprintf(err, err_len, "daemon startup timeout");
+        if (err && err_len > 0) snprintf(err, err_len, "search helper did not start (timed out)");
         stop_daemon_locked(inst);
         return -1;
     }
 
     if (strcmp(line, "READY") != 0) {
-        if (err && err_len > 0) snprintf(err, err_len, "daemon startup failed: %s", line);
+        if (err && err_len > 0) snprintf(err, err_len, "search helper failed to start: %s", line);
         stop_daemon_locked(inst);
         return -1;
     }
@@ -904,6 +908,24 @@ static void clear_ring(yt_instance_t *inst) {
     inst->played_samples = 0;
 }
 
+/* Where playback is in the track, in samples (the ring only holds the part since the stream last started). */
+static uint64_t track_pos_samples(const yt_instance_t *inst) {
+    return inst->base_abs + inst->play_abs;
+}
+
+/* The next stream start (ffmpeg -ss) begins at this track position; the ring's sample 0 will sit there. Under a second
+ * in, the offset is ignored (see start_stream), so the stream starts at 0. */
+static void set_resume_position(yt_instance_t *inst, uint64_t track_samples) {
+    double sec = (double)track_samples / (double)(MOVE_SAMPLE_RATE * 2);
+    if (sec > 1.0) {
+        inst->resume_offset_sec = sec;
+        inst->base_abs = track_samples;
+    } else {
+        inst->resume_offset_sec = 0.0;
+        inst->base_abs = 0;
+    }
+}
+
 static void restart_stream_from_beginning(yt_instance_t *inst, size_t discard_samples) {
     if (!inst) return;
     stop_stream(inst);
@@ -915,37 +937,48 @@ static void restart_stream_from_beginning(yt_instance_t *inst, size_t discard_sa
     inst->played_samples = 0;
     inst->seek_discard_samples = discard_samples;
     inst->resume_offset_sec = 0.0;
+    inst->base_abs = 0;
     inst->active_stream_resolved = false;
     inst->resolved_fallback_attempted = false;
 }
 
 static void seek_relative_seconds(yt_instance_t *inst, long delta_sec) {
-    int64_t current_samples;
-    int64_t target_samples;
-    int64_t delta_samples;
-    int64_t oldest_samples;
-    int64_t newest_samples;
+    int64_t current_track;   /* positions below are in samples; "ring" ones count from the ring's sample 0 */
+    int64_t target_track;
+    int64_t target_ring;
+    int64_t oldest_ring;
+    int64_t newest_ring;
+    bool was_paused;
     char log_msg[256];
 
     if (!inst || inst->stream_url[0] == '\0') return;
 
-    current_samples = (int64_t)inst->play_abs;
-    delta_samples = (int64_t)delta_sec * (int64_t)MOVE_SAMPLE_RATE * 2LL;
-    target_samples = current_samples + delta_samples;
-
-    oldest_samples = (int64_t)ring_oldest_abs(inst);
-    newest_samples = (int64_t)inst->write_abs;
-    if (target_samples < oldest_samples) target_samples = oldest_samples;
-    if (target_samples > newest_samples) target_samples = newest_samples;
+    current_track = (int64_t)track_pos_samples(inst);
+    target_track = current_track + (int64_t)delta_sec * (int64_t)MOVE_SAMPLE_RATE * 2LL;
+    if (target_track < 0) target_track = 0;
+    target_ring = target_track - (int64_t)inst->base_abs;
+    oldest_ring = (int64_t)ring_oldest_abs(inst);
+    newest_ring = (int64_t)inst->write_abs;
 
     snprintf(log_msg, sizeof(log_msg),
-             "seek delta=%lds cur=%lld target=%lld oldest=%lld newest=%lld moved=%lld",
-             delta_sec, (long long)current_samples, (long long)target_samples,
-             (long long)oldest_samples, (long long)newest_samples,
-             (long long)(target_samples - current_samples));
+             "seek delta=%lds track_pos=%lld target=%lld ring=[%lld..%lld] base=%lld",
+             delta_sec, (long long)current_track, (long long)target_track,
+             (long long)oldest_ring, (long long)newest_ring, (long long)inst->base_abs);
     yt_log(log_msg);
 
-    inst->play_abs = (uint64_t)target_samples;
+    if (target_ring < oldest_ring) {
+        /* Further back than the ring holds (it keeps ~15 s behind the playhead): clamping here made every rewind land on
+         * the same spot. Start the stream again at the target instead (ffmpeg -ss). */
+        was_paused = inst->paused;
+        restart_stream_from_beginning(inst, 0);
+        set_resume_position(inst, (uint64_t)target_track);
+        inst->paused = was_paused;
+        yt_log("seek: before the buffered audio, restarting the stream at the target");
+        return;
+    }
+    if (target_ring > newest_ring) target_ring = newest_ring;
+
+    inst->play_abs = (uint64_t)target_ring;
     inst->played_samples = (size_t)inst->play_abs;
 }
 
@@ -957,6 +990,7 @@ static void stop_everything(yt_instance_t *inst) {
     inst->paused = false;
     inst->played_samples = 0;
     inst->seek_discard_samples = 0;
+    inst->base_abs = 0;
     inst->active_stream_resolved = false;
     inst->resolved_fallback_attempted = false;
     stop_stream(inst);
@@ -1432,7 +1466,9 @@ static int run_search_command_daemon(yt_instance_t *inst,
             if (strcmp(fields[0], "SEARCH_END") == 0) {
                 *out_count = count;
                 if (count == 0) {
-                    if (err && err_len > 0) snprintf(err, err_len, "no results");
+                    /* the daemon may say why (field 2): bad filter, no playable videos, ... */
+                    if (err && err_len > 0)
+                        snprintf(err, err_len, "%s", field_count >= 3 && fields[2][0] ? fields[2] : "no results");
                 } else if (err && err_len > 0) {
                     err[0] = '\0';
                 }
@@ -1453,14 +1489,14 @@ static int run_search_command_daemon(yt_instance_t *inst,
     }
 
     if (retryable_timeout) {
-        if (err && err_len > 0) snprintf(err, err_len, "daemon search timeout");
+        if (err && err_len > 0) snprintf(err, err_len, "search timed out, no answer from Discogs");
         *out_count = 0;
         pthread_mutex_unlock(&inst->daemon_mutex);
         return -1;
     }
 
     pthread_mutex_unlock(&inst->daemon_mutex);
-    if (err && err_len > 0) snprintf(err, err_len, "daemon search failed");
+    if (err && err_len > 0) snprintf(err, err_len, "search helper stopped answering");
     return -1;
 }
 
@@ -1697,7 +1733,7 @@ static int resolve_stream_url_daemon(yt_instance_t *inst,
     }
 
     if (read_daemon_line_locked(inst, line, sizeof(line), DAEMON_RESOLVE_TIMEOUT_MS) != 0) {
-        if (err && err_len > 0) snprintf(err, err_len, "daemon resolve timeout");
+        if (err && err_len > 0) snprintf(err, err_len, "resolve timed out, yt-dlp gave no answer");
         stop_daemon_locked(inst);
         pthread_mutex_unlock(&inst->daemon_mutex);
         return -1;
@@ -2103,7 +2139,7 @@ static void pump_pipe(yt_instance_t *inst) {
                 !inst->resolved_fallback_attempted &&
                 supports_legacy_fallback(inst)) {
                 /* Save playback position before clearing so fallback can seek */
-                inst->resume_offset_sec = (double)inst->played_samples / (double)(MOVE_SAMPLE_RATE * 2);
+                set_resume_position(inst, track_pos_samples(inst));
                 pthread_mutex_lock(&inst->resolve_mutex);
                 inst->resolve_ready = false;
                 inst->resolve_failed = true;
@@ -2129,7 +2165,7 @@ static void pump_pipe(yt_instance_t *inst) {
             !inst->resolved_fallback_attempted &&
             supports_legacy_fallback(inst)) {
             /* Save playback position before clearing so fallback can seek */
-            inst->resume_offset_sec = (double)inst->played_samples / (double)(MOVE_SAMPLE_RATE * 2);
+            set_resume_position(inst, track_pos_samples(inst));
             pthread_mutex_lock(&inst->resolve_mutex);
             inst->resolve_ready = false;
             inst->resolve_failed = true;
@@ -2823,7 +2859,7 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     }
     if (strcmp(key, "playback_time") == 0) {
         if (!inst) return snprintf(buf, (size_t)buf_len, "0:00");
-        uint64_t total_sec = inst->play_abs / ((uint64_t)MOVE_SAMPLE_RATE * 2ULL);
+        uint64_t total_sec = track_pos_samples(inst) / ((uint64_t)MOVE_SAMPLE_RATE * 2ULL);
         unsigned int min = (unsigned int)(total_sec / 60);
         unsigned int sec = (unsigned int)(total_sec % 60);
         return snprintf(buf, (size_t)buf_len, "%u:%02u", min, sec);
@@ -2901,6 +2937,16 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         }
         if (inst->hold_start) return snprintf(buf, (size_t)buf_len, "ready");
         return snprintf(buf, (size_t)buf_len, "streaming");
+    }
+
+    if (strcmp(key, "stream_error") == 0) {
+        /* why the last resolve failed (yt-dlp's own words), empty when it didn't */
+        int ret;
+        if (!inst) return 0;
+        pthread_mutex_lock(&inst->resolve_mutex);
+        ret = snprintf(buf, (size_t)buf_len, "%s", inst->resolve_error);
+        pthread_mutex_unlock(&inst->resolve_mutex);
+        return ret;
     }
 
     if (inst && strcmp(key, "search_status") == 0) {

@@ -438,6 +438,87 @@ static void setParameter(AEffect *e, int32_t i, float v) {
     }
 }
 
+/* ---- status text: say what actually went wrong -------------------------------------------------
+ * The core keeps the cause (search_error, and yt-dlp's own words for a failed resolve); the readouts used to show
+ * only its status code ("ERROR", "NO_RESULTS", "EOF"). */
+static bool has(const std::string &hay, const char *needle) {
+    std::string h = hay, n = needle;
+    for (auto &c : h) c = (char)std::tolower((unsigned char)c);
+    for (auto &c : n) c = (char)std::tolower((unsigned char)c);
+    return h.find(n) != std::string::npos;
+}
+
+static std::string clip(const std::string &s, size_t n) {
+    return s.size() <= n ? s : s.substr(0, n - 3) + "...";
+}
+
+/* yt-dlp reports "ERROR: [youtube] abc123: Video unavailable. ...": drop the prefix and the id. */
+static std::string tidy_error(std::string e) {
+    if (e.compare(0, 7, "ERROR: ") == 0) e.erase(0, 7);
+    if (!e.empty() && e[0] == '[') {
+        size_t colon = e.find(": ");
+        if (colon != std::string::npos) e.erase(0, colon + 2);
+    }
+    return e;
+}
+
+/* STATUS is 170 px wide: a short, specific label for why a stream failed (empty = no known failure). */
+static std::string stream_failure(const std::string &err, bool dead) {
+    if (err.empty()) return dead ? "UNAVAILABLE" : "";
+    if (has(err, "yt-dlp is unavailable")) return "YT-DLP MISSING";
+    if (has(err, "private")) return "PRIVATE VIDEO";
+    if (has(err, "removed") || has(err, "been deleted") || has(err, "terminated")) return "VIDEO REMOVED";
+    if (has(err, "copyright")) return "COPYRIGHT";
+    if (has(err, "your country") || has(err, "geo")) return "REGION BLOCKED";
+    if (has(err, "confirm your age") || has(err, "age-restricted") || has(err, "sign in") ||
+        has(err, "inappropriate for some")) return "AGE / LOGIN";
+    if (has(err, "429") || has(err, "too many requests")) return "RATE LIMITED";
+    if (has(err, "timed out") || has(err, "timeout")) return "TIMED OUT";
+    if (has(err, "name or service") || has(err, "name resolution") || has(err, "unreachable") ||
+        has(err, "urlopen") || has(err, "connection")) return "NO NETWORK";
+    if (dead || has(err, "unavailable") || has(err, "not available")) return "UNAVAILABLE";
+    return "RESOLVE FAILED";
+}
+
+static std::string stream_text(Plugin *p) {
+    std::string st = core_get(p, "stream_status");
+    if (st == "eof" || st == "unavailable") {
+        std::string why = stream_failure(core_get(p, "stream_error"), st == "unavailable");
+        return why.empty() ? "TRACK ENDED" : why;
+    }
+    return upper(st);
+}
+
+/* SEARCH readout: progress, the result count, or the cause. Search causes arrive from the core already worded for
+ * this line ("Discogs rejected the token (HTTP 401)", "No playable video in 12 releases tried, ..."). */
+static std::string search_text(Plugin *p) {
+    std::string st = core_get(p, "search_status");
+    if (st == "done") {
+        std::string n = core_get(p, "search_count"), ms = core_get(p, "search_elapsed_ms");
+        char s[48];
+        std::snprintf(s, sizeof s, "DONE - %s RESULTS IN %.1fS", n.c_str(), std::atof(ms.c_str()) / 1000.0);
+        return s;
+    }
+    if (st == "searching") return "SEARCHING DISCOGS...";
+    if (st == "queued") return "QUEUED - PREVIOUS SEARCH STILL RUNNING";
+    if (st == "error" || st == "no_results") {
+        std::string e = core_get(p, "search_error");
+        if (!e.empty()) return clip(upper(e), 46);
+        return st == "error" ? "SEARCH ERROR" : "NO RESULTS";
+    }
+    return upper(st);
+}
+
+/* NOW PLAYING: the track, or when its stream failed, the track and yt-dlp's reason. */
+static std::string now_playing_text(Plugin *p, int c) {
+    std::string t = core_get_idx(p, "search_result_title_%d", c), ch = core_get_idx(p, "search_result_channel_%d", c);
+    std::string title = ch.empty() ? t : t + " - " + ch;
+    std::string st = core_get(p, "stream_status");
+    std::string err = st == "eof" || st == "unavailable" ? tidy_error(core_get(p, "stream_error")) : std::string();
+    if (err.empty()) return title;
+    return clip(t, 28) + "  |  " + clip(err, 52);
+}
+
 static std::string display(Plugin *p, int i) {
     switch (PARAMS[i].type) {
     case T_STEPPER:
@@ -459,15 +540,14 @@ static std::string display(Plugin *p, int i) {
         return idx < result_count(p) ? result_label(p, idx) : std::string();
     }
     case T_READOUT:
-        if (i == P_STATUS) return upper(core_get(p, "stream_status"));
+        if (i == P_STATUS) return stream_text(p);
         if (i == P_SYNC_STATE) return p->sync ? "SYNC ON" : "SYNC OFF";
         if (i == P_TIME) return core_get(p, "playback_time");
-        if (i == P_SEARCH_STATUS) return upper(core_get(p, "search_status"));
+        if (i == P_SEARCH_STATUS) return search_text(p);
         if (i == P_NOW_PLAYING) {
             int c = current_result(p);
             if (c < 0) return "";
-            std::string t = core_get_idx(p, "search_result_title_%d", c), ch = core_get_idx(p, "search_result_channel_%d", c);
-            return ch.empty() ? t : t + " - " + ch;
+            return now_playing_text(p, c);
         }
         return "";
     default:
