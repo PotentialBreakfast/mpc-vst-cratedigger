@@ -17,6 +17,6 @@
   "device": "Akai Force",
   "firmware": "MPC OS 3.9.1",
   "date": "2026-10-13",
-  "note": "armv7 build and skin installed from a local build of the same sources; new skin loaded, search returned 16 results, rewind and Transport Sync worked. Not the release zip itself; aarch64 not tested."
+  "note": "Release zip (armv7) installed with its install.sh: skin loaded, search returned 12 results, a track streamed, rewind and Transport Sync worked. aarch64 not tested."
  }
 ]
