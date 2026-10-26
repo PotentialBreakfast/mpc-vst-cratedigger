@@ -13,7 +13,7 @@ from fontTools.pens.transformPen import TransformPen
 from fontTools.ttLib import TTFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-INK = "#6b6558"      # the skin's ink_dim: quieter than the frame titles
+INK = "#8a93a0"      # the skin's ink_dim: quieter than the frame titles
 CAP = 17.0           # capital height in px
 REC = 25.0           # the record's diameter: taller than the capitals, centred on them
 TRACK = 3.2          # extra space between letters, px
