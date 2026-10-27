@@ -204,6 +204,9 @@ before, and Genre, Style, Region and Country are ignored for channels. The right
 channel link, an @handle, a `UC...` ID or a playlist link. The optional text after `|` is a name for
 the screen. With no `channels.txt`, nothing changes.
 
+The DECADE stepper shows a channel's name (or its @handle, without a `|` name) instead of the decade
+label, and DISCOGS for the blank setting. Edits to `channels.txt` show within a second or two.
+
 The helper reads the channel's newest 500 uploads with yt-dlp (Shorts and clips under 45 seconds
 are skipped). The list loads in the background on the first search and is cached in `/tmp` for a
 day, so that search can say "Still loading the channel": press SEARCH again. Timings and errors go

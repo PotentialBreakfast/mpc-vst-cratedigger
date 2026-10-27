@@ -19,9 +19,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
+#include <cctype>
 #include <dlfcn.h>
 #include <glob.h>
 #include <signal.h>
@@ -97,6 +100,10 @@ struct Plugin {
     std::atomic<bool> transport_playing{false};
     std::atomic<int> transport_edge{0};   /* +1 = MPC started, -1 = MPC stopped; worker consumes */
     std::string shown;                    /* all display text at the last UpdateDisplay */
+    std::string dir;                      /* module dir (channels.txt lives here) */
+    std::map<std::string, std::string> labels;  /* under lock: DECADE value ("" = any) -> channel name */
+    long long labels_mtime = -2;          /* channels.txt mtime at last load (-1 = missing) */
+    int label_tick = 0;
     char chunk[256];
 };
 
@@ -220,6 +227,72 @@ static void do_search(Plugin *p) {
     p->api->set_param(p->core, "cratedig_filter", json.c_str());
 }
 
+
+/* ---- channel names for the DECADE selector ---------------------------------
+ * channels.txt (next to bin/) maps a DECADE setting to a YouTube channel, one per line:
+ *     2020s = https://www.youtube.com/@andrenavarroII | Andre Navarro II
+ * The helper script uses the link; the screen shows the name after the "|" (or the @handle
+ * when there is no name). Decades that are not listed keep their normal label. */
+static std::string trim(const std::string &s) {
+    size_t a = s.find_first_not_of(" \t\r\n"), b = s.find_last_not_of(" \t\r\n");
+    return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+}
+static std::string label_from(const std::string &value, const std::string &name) {
+    std::string n = trim(name);
+    if (n.empty()) {
+        size_t at = value.find('@');
+        if (at != std::string::npos) {
+            size_t end = value.find_first_of("/? \t", at);
+            n = value.substr(at + 1, end == std::string::npos ? std::string::npos : end - at - 1);
+        }
+    }
+    if (n.empty()) n = "CHANNEL";
+    if (n.size() > 24) n.resize(24);
+    return n;
+}
+static void load_labels(Plugin *p) {   /* caller holds p->lock */
+    static const char *FREE[] = {"2020s", "2010s", "2000s", "1990s", "1980s", "1970s", "1960s", "1950s"};
+    p->labels.clear();
+    struct stat sb;
+    std::string path = p->dir + "/channels.txt";
+    if (stat(path.c_str(), &sb) != 0) { p->labels_mtime = -1; return; }
+    p->labels_mtime = (long long)sb.st_mtime;
+    FILE *f = std::fopen(path.c_str(), "r");
+    if (!f) return;
+    std::vector<std::string> loose;
+    char buf[1024];
+    while (std::fgets(buf, sizeof buf, f)) {
+        std::string line = trim(buf);
+        if (line.empty() || line[0] == '#') continue;
+        std::string name, value = line;
+        size_t bar = line.find('|');
+        if (bar != std::string::npos) { value = trim(line.substr(0, bar)); name = line.substr(bar + 1); }
+        size_t eq = value.find('=');
+        std::string key, val = value;
+        if (eq != std::string::npos) {
+            key = trim(value.substr(0, eq));
+            for (auto &c : key) c = (char)std::tolower((unsigned char)c);
+            bool ok = key == "any" || (key.size() == 5 && key[4] == 's' && std::isdigit((unsigned char)key[0]) &&
+                      std::isdigit((unsigned char)key[1]) && std::isdigit((unsigned char)key[2]) && std::isdigit((unsigned char)key[3]));
+            if (ok) {
+                val = trim(value.substr(eq + 1));
+                p->labels[key == "any" ? std::string() : key] = label_from(val, name);
+                continue;
+            }
+        }
+        loose.push_back(label_from(value, name));
+    }
+    std::fclose(f);
+    for (auto &l : loose)
+        for (const char *d : FREE)
+            if (!p->labels.count(d)) { p->labels[d] = l; break; }
+}
+static void reload_labels_if_changed(Plugin *p) {   /* caller holds p->lock */
+    struct stat sb;
+    long long m = stat((p->dir + "/channels.txt").c_str(), &sb) == 0 ? (long long)sb.st_mtime : -1;
+    if (m != p->labels_mtime) load_labels(p);
+}
+
 static std::string display(Plugin *p, int i);
 
 /* MPC only re-reads parameter text after audioMasterUpdateDisplay (verified: without it,
@@ -270,6 +343,11 @@ static void worker_main(Plugin *p) {
         if (now >= next_ui) {
             next_ui = now + std::chrono::milliseconds(200);
             flush_releases(p);
+            if (++p->label_tick >= 5) {
+                p->label_tick = 0;
+                std::lock_guard<std::mutex> lk(p->lock);
+                reload_labels_if_changed(p);
+            }
             refresh_display(p);
         }
         if (int edge = p->transport_edge.exchange(0)) {
@@ -499,7 +577,8 @@ static std::string search_text(Plugin *p) {
         std::snprintf(s, sizeof s, "DONE - %s RESULTS IN %.1fS", n.c_str(), std::atof(ms.c_str()) / 1000.0);
         return s;
     }
-    if (st == "searching") return "SEARCHING DISCOGS...";
+    if (st == "searching")
+        return p->labels.count(dim_value(p, DIM_DECADE)) ? "SEARCHING CHANNEL..." : "SEARCHING DISCOGS...";
     if (st == "queued") return "QUEUED - PREVIOUS SEARCH STILL RUNNING";
     if (st == "error" || st == "no_results") {
         std::string e = core_get(p, "search_error");
@@ -528,6 +607,11 @@ static std::string display(Plugin *p, int i) {
             return s;
         } else {
             const char *v = dim_value(p, i);
+            if (i == DIM_DECADE) {
+                auto it = p->labels.find(v);
+                if (it != p->labels.end()) return upper(it->second);
+                if (!v[0]) return "DISCOGS";
+            }
             return v[0] ? upper(v) : std::string("ANY");
         }
     case T_FLOAT: {
@@ -669,6 +753,11 @@ extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMa
     p->master = master;
     std::memset((void *)p->release, 0, sizeof p->release);
     for (int i = 0; i < NPARAMS; i++) p->last[i] = 0.0f;
+    p->dir = dir;
+    {
+        std::lock_guard<std::mutex> lk(p->lock);
+        load_labels(p);
+    }
     p->core = api->create_instance(dir.c_str(), nullptr);
     if (!p->core) { delete p; return nullptr; }
     api->set_param(p->core, "search_provider", "cratedig");
