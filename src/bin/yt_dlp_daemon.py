@@ -1079,16 +1079,16 @@ def samplette_search(session: SampletteSession, count_text: str) -> None:
     write_fields("SEARCH_END", str(n))
 
 
-def cratedig_init(session: CrateDigSession) -> None:
+def discogs_init(session: CrateDigSession) -> None:
     write_fields("CRATEDIG_OK")
 
 
-def cratedig_filter(session: CrateDigSession, filter_json: str) -> None:
+def discogs_filter(session: CrateDigSession, filter_json: str) -> None:
     session.set_filter(filter_json)
     write_fields("CRATEDIG_OK")
 
 
-def cratedig_search(session: CrateDigSession, count_text: str) -> None:
+def discogs_search(session: CrateDigSession, count_text: str) -> None:
     try:
         count = int(count_text)
     except Exception:
@@ -1128,6 +1128,253 @@ def cratedig_search(session: CrateDigSession, count_text: str) -> None:
         write_fields("SEARCH_END", str(n))
     else:
         write_fields("SEARCH_END", "0", session.empty_reason or "Discogs results had no usable video links")
+
+
+# ---------------------------------------------------------------------------
+# Channel Digger. SEARCH digs Discogs as usual, unless the DECADE control is set to a
+# decade that channels.txt maps to a YouTube channel. Then SEARCH picks random uploads
+# from that channel instead (the Genre/Style/Region/Country filters are ignored).
+#
+# channels.txt sits in the Crate Digger folder (next to bin/), one channel per line:
+#     2020s = https://www.youtube.com/@yourchannel | Your Channel
+#     (the text after | is the name shown on the Crate Digger screen)
+#     2010s = @anotherchannel
+#     any   = UCxxxxxxxxxxxxxxxxxxxxxx       (the blank DECADE setting)
+# A line with only a link takes the next free decade, counting down from 2020s.
+# Accepted: channel link, @handle, UC... channel ID, or a playlist link.
+# ---------------------------------------------------------------------------
+CHANNEL_DEFAULT = ""   # no built-in channel: add yours to channels.txt
+CHANNEL_CACHE_SECONDS = 24 * 3600
+CHANNEL_WAIT_SECONDS = 10
+CHANNEL_MAX_ITEMS = 500   # newest uploads only; keeps loading quick on the MPC's CPU
+FREE_DECADES = ["2020s", "2010s", "2000s", "1990s", "1980s", "1970s", "1960s", "1950s"]
+
+_YT = None
+_cur = {"decade": ""}
+_src = {}
+
+
+def chlog(msg: str) -> None:
+    try:
+        import time
+        with open("/tmp/channel_digger.log", "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
+def load_channels() -> dict:
+    """Map DECADE setting ('' = blank) to a channel setting string."""
+    path = os.path.join(module_dir(), "channels.txt")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return {"2020s": CHANNEL_DEFAULT} if CHANNEL_DEFAULT else {}
+    mapping = {}
+    loose = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^(any|\d{4}s)\s*=\s*(.+)$", line, re.IGNORECASE)
+        if m:
+            key = m.group(1).lower()
+            mapping["" if key == "any" else key] = m.group(2).split("|")[0].strip()
+        else:
+            loose.append(line.split("|")[0].strip())
+    for line in loose:
+        for d in FREE_DECADES:
+            if d not in mapping:
+                mapping[d] = line
+                break
+    return mapping
+
+
+def channel_list_url(v: str) -> str:
+    m = re.search(r"UC[\w-]{22}", v)
+    if m:
+        return "https://www.youtube.com/playlist?list=UU" + m.group(0)[2:]
+    m = re.search(r"[?&]list=([\w-]+)", v)
+    if m:
+        return "https://www.youtube.com/playlist?list=" + m.group(1)
+    if v.startswith("@"):
+        v = "https://www.youtube.com/" + v
+    elif not v.startswith("http"):
+        v = "https://www.youtube.com/@" + v
+    v = v.split("?")[0].rstrip("/")
+    if not re.search(r"/(videos|streams|releases)$", v):
+        v += "/videos"
+    return v
+
+
+def _flatten_entries(data) -> list:
+    out = []
+    if isinstance(data, dict):
+        for e in data.get("entries") or []:
+            if isinstance(e, dict) and e.get("entries"):
+                out.extend(_flatten_entries(e))
+            elif isinstance(e, dict):
+                out.append(e)
+    return out
+
+
+def channel_fetch(url: str):
+    import hashlib
+    import tempfile
+    import time
+
+    key = hashlib.md5(url.encode("utf-8")).hexdigest()[:10]
+    cache_path = os.path.join(tempfile.gettempdir(), f"channel_digger_{key}.json")
+    try:
+        if time.time() - os.path.getmtime(cache_path) < CHANNEL_CACHE_SECONDS:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if cached.get("items"):
+                return cached["items"], cached.get("name", "")
+    except Exception:
+        pass
+
+    ensure_ytdlp(_YT)
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 15,
+        "extract_flat": True,
+        "playlistend": CHANNEL_MAX_ITEMS,
+        "extractor_args": {"youtube": {"player_skip": ["js"]}},
+    }
+    t0 = time.time()
+    chlog(f"fetching {url}")
+    with _YT.YoutubeDL(opts) as ydl:
+        data = ydl.extract_info(url, download=False)
+    chlog(f"fetched in {time.time() - t0:.1f}s")
+
+    name = ""
+    if isinstance(data, dict):
+        name = clean_field(data.get("channel") or data.get("uploader") or "")
+    items = []
+    seen_ids = set()
+    for e in _flatten_entries(data):
+        vid = clean_field(e.get("id") or "")
+        title = clean_field(e.get("title") or "")
+        link = clean_field(e.get("url") or e.get("webpage_url") or "")
+        if not re.fullmatch(r"[\w-]{11}", vid) or vid in seen_ids or not title:
+            continue
+        if "/shorts/" in link:
+            continue
+        dur = e.get("duration")
+        try:
+            if dur is not None and float(dur) < 45:
+                continue
+        except Exception:
+            pass
+        if not name:
+            name = clean_field(e.get("channel") or e.get("uploader") or "")
+        seen_ids.add(vid)
+        items.append({
+            "id": vid,
+            "title": title,
+            "duration": format_duration(dur),
+            "url": f"https://www.youtube.com/watch?v={vid}",
+        })
+    if not items:
+        raise RuntimeError("no playable videos found on that channel")
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump({"name": name, "items": items}, f)
+    except Exception:
+        pass
+    return items, name
+
+
+def channel_state(url: str) -> dict:
+    import threading
+
+    st = _src.get(url)
+    if st is not None and st["error"] and not st["thread"].is_alive():
+        st = None   # last attempt failed: try again on the next search
+    if st is None:
+        st = {"thread": None, "entries": None, "name": "", "error": "", "seen": set()}
+        _src[url] = st
+
+        def worker():
+            try:
+                items, name = channel_fetch(url)
+                st["name"] = name
+                st["entries"] = items
+                chlog(f"ready: {len(items)} tracks from {name!r}")
+            except Exception as exc:
+                st["error"] = describe_error(exc)
+                chlog(f"fetch failed: {exc}")
+
+        st["thread"] = threading.Thread(target=worker, daemon=True)
+        st["thread"].start()
+    return st
+
+
+def channel_search(count_text: str, setting: str) -> None:
+    import random
+
+    try:
+        count = int(count_text)
+    except Exception:
+        count = 8
+    count = max(1, min(count, 16))
+
+    st = channel_state(channel_list_url(setting))
+    if st["entries"] is None and st["thread"].is_alive():
+        st["thread"].join(CHANNEL_WAIT_SECONDS)
+
+    entries = st["entries"]
+    if entries is None:
+        if st["error"]:
+            write_fields("ERROR", st["error"])
+        else:
+            write_fields("SEARCH_BEGIN")
+            write_fields("SEARCH_END", "0", "Still loading the channel, press search again")
+        return
+
+    seen = st["seen"]
+    pool = [e for e in entries if e["id"] not in seen]
+    if len(pool) < min(count, len(entries)):
+        seen.clear()
+        pool = list(entries)
+    picks = random.sample(pool, min(count, len(pool)))
+    for e in picks:
+        seen.add(e["id"])
+
+    write_fields("SEARCH_BEGIN")
+    for e in picks:
+        write_fields("SEARCH_ITEM", e["id"], e["title"], st["name"], e["duration"], e["url"],
+                     "", "", "", "", "", "", "")
+    write_fields("SEARCH_END", str(len(picks)))
+
+
+def cratedig_init(session) -> None:
+    write_fields("CRATEDIG_OK")
+
+
+def cratedig_filter(session, filter_json: str) -> None:
+    try:
+        f = json.loads(filter_json or "{}")
+    except Exception:
+        f = {}
+    _cur["decade"] = str(f.get("decade") or "").strip() if isinstance(f, dict) else ""
+    try:
+        session.set_filter(filter_json)
+    except Exception:
+        pass
+    write_fields("CRATEDIG_OK")
+
+
+def cratedig_search(session, count_text: str) -> None:
+    setting = load_channels().get(_cur["decade"])
+    if setting:
+        chlog(f"decade={_cur['decade'] or 'any'} -> channel {setting}")
+        channel_search(count_text, setting)
+    else:
+        discogs_search(session, count_text)
 
 
 def parse_search_parts(parts: list):
@@ -1221,6 +1468,8 @@ def main() -> int:
     except Exception:
         yt_dlp_mod = None
 
+    global _YT
+    _YT = yt_dlp_mod
     samplette = SampletteSession()
     config = load_provider_config()
     # Schwung-manager managed secret takes precedence, then legacy provider

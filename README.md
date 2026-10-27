@@ -186,6 +186,29 @@ public rate limit). For 60/min, generate a free personal access token at
 { "providers": { "cratedig": { "token": "YOUR_DISCOGS_PERSONAL_TOKEN" } } }
 ```
 
+## YouTube channels (optional)
+
+Besides Discogs, SEARCH can list random uploads from YouTube channels. List them in `channels.txt`
+in the engine folder, next to `bin/` (for example `/sdcard/vst/cratedigger/channels.txt`), one per
+line (see `docs/channels.example.txt`):
+
+```
+2020s = https://www.youtube.com/@handle | Name
+2010s = @anotherchannel
+any = UCxxxxxxxxxxxxxxxxxxxxxx | Some Channel
+```
+
+The left side is a value of the DECADE stepper (`any` is the blank setting). When DECADE is on a
+listed value, SEARCH returns random uploads from that channel; every other value digs Discogs as
+before, and Genre, Style, Region and Country are ignored for channels. The right side can be a
+channel link, an @handle, a `UC...` ID or a playlist link. The optional text after `|` is a name for
+the screen. With no `channels.txt`, nothing changes.
+
+The helper reads the channel's newest 500 uploads with yt-dlp (Shorts and clips under 45 seconds
+are skipped). The list loads in the background on the first search and is cached in `/tmp` for a
+day, so that search can say "Still loading the channel": press SEARCH again. Timings and errors go
+to `/tmp/channel_digger.log`.
+
 ## Troubleshooting
 
 Search showing an "error" status, rate limits, and reading the on-device log: see
